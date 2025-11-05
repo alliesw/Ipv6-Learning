@@ -1,0 +1,507 @@
+Follow these steps to add data validation to an AWS EMR job.
+
+Add CI-Utils references to data_validation in the job level .gitlab-ci.yml file. Also add a reference to folium/utils.sh for email.
+.gitlab-ci.yml
+
+
+    CI_UTILS_SCRIPTS: >
+      folium/utils.sh
+		...
+      spark/spark_sql_dynamic.py
+      data_validation/validation_compare.hql
+      data_validation/load_validation.py
+      data_validation/run_validation.sh
+    DDL_DIR: "$INGEST_RTMSCM_DS_DIR/ddl"
+    HQL_DIR: "$INGEST_RTMSCM_DS_DIR/hql"
+    SPARK_DIR: "$INGEST_RTMSCM_DS_DIR/spark"
+
+
+Add "prod_hsd.hsd_load_validation" to terraform.tfvars write_db_table_names
+Terraform Table Permissions
+
+
+### Change per-job ###
+read_db_table_names = [
+]
+write_db_table_names = [
+...
+"prod_hsd.hsd_load_validation"
+]
+
+
+
+Add SKIP_VALIDATION input parameter to execute_hql.sh script
+Skip Validation Flag
+
+
+  export RELOAD_FLAG=$(echo ${ADDITIONAL_PARAMS} | jq '.RELOAD_FLAG' | tr -d '"')
+  export RELOAD_START_DATE=$(echo ${ADDITIONAL_PARAMS} | jq '.RELOAD_START_DATE' | tr -d '"')
+  export RELOAD_END_DATE=$(echo ${ADDITIONAL_PARAMS} | jq '.RELOAD_END_DATE' | tr -d '"')
+  export SKIP_VALIDATION=$(echo ${ADDITIONAL_PARAMS} | jq '.SKIP_VALIDATION' | tr -d '"')
+  echo ""
+  echo "##################################################"
+  echo "#"
+  echo "#    RELOAD_FLAG=${RELOAD_FLAG}"
+  echo "#    RELOAD_START_DATE=${RELOAD_START_DATE}"
+  echo "#    RELOAD_END_DATE=${RELOAD_END_DATE}"
+  echo "#    SKIP_VALIDATION=${SKIP_VALIDATION}"
+  echo "#"
+  echo "##################################################"
+  echo ""
+
+
+Create environment level validation variables in execute_hql.sh script.
+
+Required environmental variables:
+VALIDATION_STEP_NAME: Should be set to the job folder name. This will be a partition in the hsd_load_validation table eg. 10-load-cma
+VALIDATION_SOURCE_TABLE_NAME: Source data table. Could be from S3 or Snowflake. Will be a partition in the validation table. eg hsd_modcomp_daily_import
+LOAD_DATE: Validation partition date (previous day).
+VALIDATION_EMAIL_TO: Set to "DL-Connectivity-Insights-ETL@charter.com". If this is not set script will default to value of "DL-Connectivity-Insights@charter.com".
+
+execute_hql.sh - Environment Variables
+
+
+### Add validation step name and source table name as environment variables
+export LOAD_DATE=$(date -d "$PARTITION_DATE -1 day" +%Y-%m-%d)  # <-- For hourly jobs: validate previous day's data
+export VALIDATION_PREFIX="scp_plm_nghbr_rprt_dly" <-- prefix to be used for *_sql_template_tmb_table.spark & *_validation.conf files
+export VALIDATION_STEP_NAME="02v-scp-plume-neighbor-report-daily" <-- job that validation script is being added to
+export VALIDATION_SOURCE_TABLE_NAME=$enc_table_name <-- this will be the table you are validating, update to the job specific table variable
+export VALIDATION_EMAIL_TO="DL-Connectivity-Insights-ETL@charter.com" <-- If this is not set script will default to value of "DL-Connectivity-Insights@charter.com". 
+CRITICAL: Add Duplicate Prevention Logic
+
+To prevent duplicate validation emails (especially important for hourly jobs), add this logic before running validation:
+execute_hql.sh - Duplicate Prevention
+
+
+#### Get the max partition_date value for the src_step_name from the hsd_load_validation table to check whether the validations are already done for prev day
+VALIDATION_BASE_S3=$(aws glue get-table --database-name prod_hsd --name hsd_load_validation --query 'Table.StorageDescriptor.Location' --output text)
+MAX_VALIDATION_LOAD_DATE=$(aws s3 ls "${VALIDATION_BASE_S3}/src_step_name=${VALIDATION_STEP_NAME}/src_table_name=${VALIDATION_SOURCE_TABLE_NAME}/" | sort -ru | awk -F"=" '{print$2}' | head -1 | sed 's/.$//' ) || MAX_VALIDATION_LOAD_DATE=""
+echo "### MAX_VALIDATION_LOAD_DATE: $MAX_VALIDATION_LOAD_DATE ###"
+
+if [[ ("${MAX_VALIDATION_LOAD_DATE}" == "") ]]; then
+  export MAX_VALIDATION_LOAD_DATE=${LOAD_DATE}
+fi
+
+#### When the validations are already completed for the prev day then just skip the validation process, else continue doing so.
+if [[ ("${LOAD_DATE}" == "${MAX_VALIDATION_LOAD_DATE}") ]]; then
+    echo "### Validation process for ${LOAD_DATE} is already completed, hence skipping the validation process... ###"    
+    echo "###############################################################################" 
+else
+  echo "### Proceeding with the validation process... ###"
+  # ... run validation logic here ...
+fi ### validations end
+
+Key Points:
+Uses dynamic S3 path lookup via Glue catalog for maintainability
+Compares LOAD_DATE (previous day) with last validation date
+Prevents duplicate emails during timezone crossover periods
+Ensures validation runs only once per day for each date
+RELOAD Behavior - Important Note
+
+The team is aware that this script will not reprocess metrics in the event of RELOAD_FLAG usage
+This is expected and accepted behavior by ETL standards (as of 2025-09-22)
+Add a script to populate the hsd_load_validation table.
+
+The name of the file should begin with the VALIDATION_PREFIX.
+The spark_run_validation  of data_validation/run_validation.sh only has certain DBs defined. If you need something like a Lookup DB, you need to buidl it in the _tmp_table.spark  script as {HSD_DB}_lkp. for it to work
+<<REPLACE_TMP_TABLE_NAME>>: uses the tmp table created, combination of prefix and epoch_timestamp
+<<REPLACE_NULL_COUNT_COLUMNS>>: pulls in the null fields from *_validation.conf
+DISTINCT COUNTS will need to be added using the fields from *_validation.conf
+<<REPLACE_TMP_TABLE_NAME>>: uses the tmp table created, combination of prefix and epoch_timestamp
+<<REPLACE_VALIDATION_SQL>>: uses the validation sql validation_compare.hql: https://gitlab.spectrumflow.net/awspilot/ci-utils/-/blob/master/aws/data_validation/validation_compare.hql?ref_type=heads
+     
+hsd_load_validation is partitioned by: src_step_name, src_table_name, src_partition_date
+
+
+scp_plm_nghbr_rprt_dly_sql_template_tmp_table.spark
+
+
+INSERT INTO TABLE default.<<REPLACE_TMP_TABLE_NAME>>
+SELECT
+<<REPLACE_NULL_COUNT_COLUMNS>>
+  , COUNT(DISTINCT location_id) AS unique_location_id_count
+  , COUNT(DISTINCT neighbor_location_id) AS unique_neighbor_location_id_count
+  , COUNT(DISTINCT encrypted_neighbor_id_256) AS unique_encrypted_neighbor_id_256_count
+  , COUNT(DISTINCT encrypted_neighbor_ssid_256) AS unique_encrypted_neighbor_ssid_256_count
+  , COUNT(*) AS total_record_count
+FROM {CIWIFI_DB}.{VALIDATION_SOURCE_TABLE_NAME}
+WHERE partition_date = '{LOAD_DATE}';
+
+INSERT OVERWRITE TABLE {HSD_DB}.hsd_load_validation partition (src_step_name, src_table_name, src_partition_date)
+SELECT 
+  metric_name
+  , metric_type
+  , metric_count
+  , threshold_type
+  , threshold
+  , compare_type
+  , compare_total
+  , '{VALIDATION_STEP_NAME}' AS job_name
+  , 'partition_date' AS src_partition_nm
+  , 'daily' AS src_partition_type
+  , error_level
+  , CURRENT_TIMESTAMP AS load_dts
+  , '{VALIDATION_STEP_NAME}' AS src_step_name
+  , '{VALIDATION_SOURCE_TABLE_NAME}' AS src_table_name
+  , '{LOAD_DATE}' AS src_partition_date
+FROM (
+       <<REPLACE_VALIDATION_SQL>>
+     ) AS union_query
+;
+Add a configuration file to the scripts folder.
+
+The name of the file should begin with the VALIDATION_PREFIX.
+
+[source column name → this can be a column name from the source or an aggregate column taken from the load validation query above. e.g. total_record_count]
+metric_type = total_count, unique_count, or null_count
+metric_count = name of metric
+threshold_type = upper, lower, or abs (absolute value, +/-)
+threshold = percentage value
+compare_type = current_total or previous_count
+compare_total = column to compare with when compare_type is current_total. Otherwise null.
+error_level = fail or warning (these will both send emails containing message with link to EMR)
+
+
+
+hsd_rtmscm_ds_validation.conf
+
+
+[location_id]
+metric_type = null_count
+metric_count = location_id_null_count
+threshold_type = upper
+threshold = .0001
+compare_type = current_total
+compare_total = total_record_count
+error_level = warning
+
+[neighbor_location_id]
+metric_type = null_count
+metric_count = neighbor_location_id_null_count
+threshold_type = upper
+threshold = 50
+compare_type = current_total
+compare_total = total_record_count
+error_level = warning
+
+[encrypted_neighbor_id_256]
+metric_type = null_count
+metric_count = encrypted_neighbor_id_256_null_count
+threshold_type = upper
+threshold = .0001
+compare_type = current_total
+compare_total = total_record_count
+error_level = warning
+
+[encrypted_neighbor_ssid_256]
+metric_type = null_count
+metric_count = encrypted_neighbor_ssid_256_null_count
+threshold_type = upper
+threshold = 10
+compare_type = current_total
+compare_total = total_record_count
+error_level = warning
+
+[unique_location_id_count]
+metric_type = unique_count
+metric_count = unique_location_id_count
+threshold_type = abs
+threshold = 10
+compare_type = previous_count
+compare_total = null
+error_level = warning
+
+[unique_neighbor_location_id_count]
+metric_type = unique_count
+metric_count = unique_neighbor_location_id_count
+threshold_type = abs
+threshold = 10
+compare_type = previous_count
+compare_total = null
+error_level = warning
+
+[unique_encrypted_neighbor_id_256_count]
+metric_type = unique_count
+metric_count = unique_encrypted_neighbor_id_256_count
+threshold_type = abs
+threshold = 10
+compare_type = previous_count
+compare_total = null
+error_level = warning
+
+[unique_encrypted_neighbor_ssid_256_count]
+metric_type = unique_count
+metric_count = unique_encrypted_neighbor_ssid_256_count
+threshold_type = abs
+threshold = 10
+compare_type = previous_count
+compare_total = null
+error_level = warning
+
+[total_record_count]
+metric_type = total_count
+metric_count = total_record_count
+threshold_type = abs
+threshold = 20
+compare_type = previous_count
+compare_total = null
+error_level = warning
+
+
+Update your execute_hql.sh script
+
+
+execute_hql.sh - Final Implementation
+
+
+echo "********************* Variables *************************"
+  echo "CIWIFI_DB = ${CIWIFI_DB}"
+  echo "HSD_DB = ${HSD_DB}"
+  echo "VALIDATION_SOURCE_TABLE_NAME" = ${VALIDATION_SOURCE_TABLE_NAME}
+  echo "LOAD_DATE" = ${LOAD_DATE}
+  echo "VALIDATION_EMAIL_TO" = ${VALIDATION_EMAIL_TO}
+  echo "********************************************************"
+
+echo "-------------------------Run Validation Script-------------------------"
+echo "source ./scripts/run_validation-${SCRIPT_VERSION}.sh \"scp_plm_nghbr_rprt_dly\""
+source ./scripts/run_validation-${SCRIPT_VERSION}.sh "scp_plm_nghbr_rprt_dly"
+echo "#### Validation completed for partition_date=${LOAD_DATE} ####"
+
+
+
+EMR Log example
+
+Validation Query:
+EMR Log
+
+
+INSERT INTO TABLE default.scp_plm_nghbr_rprt_dly_1739788646929957614
+SELECT
+  count(CASE WHEN location_id = '' or location_id='~!NULL!' or location_id is NULL then 1 end) AS location_id_null_count ,
+  count(CASE WHEN neighbor_location_id = '' or neighbor_location_id='~!NULL!' or neighbor_location_id is NULL then 1 end) AS neighbor_location_id_null_count ,
+  count(CASE WHEN encrypted_neighbor_id_256 = '' or encrypted_neighbor_id_256='~!NULL!' or encrypted_neighbor_id_256 is NULL then 1 end) AS encrypted_neighbor_id_256_null_count ,
+  count(CASE WHEN encrypted_neighbor_ssid_256 = '' or encrypted_neighbor_ssid_256='~!NULL!' or encrypted_neighbor_ssid_256 is NULL then 1 end) AS encrypted_neighbor_ssid_256_null_count 
+  , COUNT(DISTINCT location_id) AS unique_location_id_count
+  , COUNT(DISTINCT neighbor_location_id) AS unique_neighbor_location_id_count
+  , COUNT(DISTINCT encrypted_neighbor_id_256) AS unique_encrypted_neighbor_id_256_count
+  , COUNT(DISTINCT encrypted_neighbor_ssid_256) AS unique_encrypted_neighbor_ssid_256_count
+  , COUNT(*) AS total_record_count
+FROM {CIWIFI_DB}.{VALIDATION_SOURCE_TABLE_NAME}
+WHERE partition_date = '{LOAD_DATE}';
+
+INSERT OVERWRITE TABLE {HSD_DB}.hsd_load_validation partition (src_step_name, src_table_name, src_partition_date)
+SELECT 
+  metric_name
+  , metric_type
+  , metric_count
+  , threshold_type
+  , threshold
+  , compare_type
+  , compare_total
+  , '{VALIDATION_STEP_NAME}' AS job_name
+  , 'partition_date' AS src_partition_nm
+  , 'daily' AS src_partition_type
+  , error_level
+  , CURRENT_TIMESTAMP AS load_dts
+  , '{VALIDATION_STEP_NAME}' AS src_step_name
+  , '{VALIDATION_SOURCE_TABLE_NAME}' AS src_table_name
+  , '{LOAD_DATE}' AS src_partition_date
+FROM (
+       SELECT 'location_id' as metric_name,
+'null_count' as metric_type,
+location_id_null_count as metric_count,
+'upper' as threshold_type,
+'.0001' as threshold,
+'current_total' as compare_type,
+total_record_count as compare_total,
+'warning' as error_level 
+  FROM default.scp_plm_nghbr_rprt_dly_1739788646929957614 
+ UNION ALL 
+SELECT 'neighbor_location_id' as metric_name,
+'null_count' as metric_type,
+neighbor_location_id_null_count as metric_count,
+'upper' as threshold_type,
+'50' as threshold,
+'current_total' as compare_type,
+total_record_count as compare_total,
+'warning' as error_level 
+  FROM default.scp_plm_nghbr_rprt_dly_1739788646929957614 
+ UNION ALL 
+SELECT 'encrypted_neighbor_id_256' as metric_name,
+'null_count' as metric_type,
+encrypted_neighbor_id_256_null_count as metric_count,
+'upper' as threshold_type,
+'.0001' as threshold,
+'current_total' as compare_type,
+total_record_count as compare_total,
+'warning' as error_level 
+  FROM default.scp_plm_nghbr_rprt_dly_1739788646929957614 
+ UNION ALL 
+SELECT 'encrypted_neighbor_ssid_256' as metric_name,
+'null_count' as metric_type,
+encrypted_neighbor_ssid_256_null_count as metric_count,
+'upper' as threshold_type,
+'10' as threshold,
+'current_total' as compare_type,
+total_record_count as compare_total,
+'warning' as error_level 
+  FROM default.scp_plm_nghbr_rprt_dly_1739788646929957614 
+ UNION ALL 
+SELECT 'unique_location_id_count' as metric_name,
+'unique_count' as metric_type,
+unique_location_id_count as metric_count,
+'abs' as threshold_type,
+'10' as threshold,
+'previous_count' as compare_type,
+null as compare_total,
+'warning' as error_level 
+  FROM default.scp_plm_nghbr_rprt_dly_1739788646929957614 
+ UNION ALL 
+SELECT 'unique_neighbor_location_id_count' as metric_name,
+'unique_count' as metric_type,
+unique_neighbor_location_id_count as metric_count,
+'abs' as threshold_type,
+'10' as threshold,
+'previous_count' as compare_type,
+null as compare_total,
+'warning' as error_level 
+  FROM default.scp_plm_nghbr_rprt_dly_1739788646929957614 
+ UNION ALL 
+SELECT 'unique_encrypted_neighbor_id_256_count' as metric_name,
+'unique_count' as metric_type,
+unique_encrypted_neighbor_id_256_count as metric_count,
+'abs' as threshold_type,
+'10' as threshold,
+'previous_count' as compare_type,
+null as compare_total,
+'warning' as error_level 
+  FROM default.scp_plm_nghbr_rprt_dly_1739788646929957614 
+ UNION ALL 
+SELECT 'unique_encrypted_neighbor_ssid_256_count' as metric_name,
+'unique_count' as metric_type,
+unique_encrypted_neighbor_ssid_256_count as metric_count,
+'abs' as threshold_type,
+'10' as threshold,
+'previous_count' as compare_type,
+null as compare_total,
+'warning' as error_level 
+  FROM default.scp_plm_nghbr_rprt_dly_1739788646929957614 
+     ) AS union_query
+
+EMR Readout
+EMR Log - Validation Readout
+
+
+------------VALIDATATION_DATA_STRING--------------------------------------------
+unique_encrypted_neighbor_ssid_256_count|PASS|[unique_count: curr=27085764,prev=27381293,threshold=10]|warning|2025-02-16 unique_encrypted_neighbor_id_256_count|PASS|[unique_count: curr=81517512,prev=82635494,threshold=10]|warning|2025-02-16 encrypted_neighbor_id_256|PASS|[null_count: curr=0,total_records=691520012,threshold=.0001]|warning|2025-02-16 encrypted_neighbor_ssid_256|PASS|[null_count: curr=32005136,total_records=691520012,threshold=10]|warning|2025-02-16 unique_neighbor_location_id_count|PASS|[unique_count: curr=16309006,prev=16384233,threshold=10]|warning|2025-02-16 neighbor_location_id|PASS|[null_count: curr=312706470,total_records=691520012,threshold=50]|warning|2025-02-16 unique_location_id_count|PASS|[unique_count: curr=16663555,prev=16694136,threshold=10]|warning|2025-02-16 location_id|PASS|[null_count: curr=0,total_records=691520012,threshold=.0001]|warning|2025-02-16 total_record_count|PASS|[total_count: curr=691520012,prev=735525195,threshold=20]|warning|2025-02-16
+--------------------------------------------------------------------------------
+
+------------VALIDATATION_DATA_ARRAY---------------------------------------------
+unique_encrypted_neighbor_ssid_256_count|PASS|[unique_count: curr=27085764,prev=27381293,threshold=10]|warning|2025-02-16
+--------------------------------------------------------------------------------
+
+
+################## PASS ##########################
+metric name=unique_encrypted_neighbor_ssid_256_count
+VALIDATION RESULT=PASS
+metric detail=[unique_count: curr=27085764,prev=27381293,threshold=10]
+source partition date=2025-02-16
+***
+*** Validation passed for unique_encrypted_neighbor_ssid_256_count on 2025-02-16
+***
+########################################################
+
+################## PASS ##########################
+metric name=unique_encrypted_neighbor_id_256_count
+VALIDATION RESULT=PASS
+metric detail=[unique_count: curr=81517512,prev=82635494,threshold=10]
+source partition date=2025-02-16
+***
+*** Validation passed for unique_encrypted_neighbor_id_256_count on 2025-02-16
+***
+########################################################
+
+################## PASS ##########################
+metric name=encrypted_neighbor_id_256
+VALIDATION RESULT=PASS
+metric detail=[null_count: curr=0,total_records=691520012,threshold=.0001]
+source partition date=2025-02-16
+***
+*** Validation passed for encrypted_neighbor_id_256 on 2025-02-16
+***
+########################################################
+
+################## PASS ##########################
+metric name=encrypted_neighbor_ssid_256
+VALIDATION RESULT=PASS
+metric detail=[null_count: curr=32005136,total_records=691520012,threshold=10]
+source partition date=2025-02-16
+***
+*** Validation passed for encrypted_neighbor_ssid_256 on 2025-02-16
+***
+########################################################
+
+################## PASS ##########################
+metric name=unique_neighbor_location_id_count
+VALIDATION RESULT=PASS
+metric detail=[unique_count: curr=16309006,prev=16384233,threshold=10]
+source partition date=2025-02-16
+***
+*** Validation passed for unique_neighbor_location_id_count on 2025-02-16
+***
+########################################################
+
+################## PASS ##########################
+metric name=neighbor_location_id
+VALIDATION RESULT=PASS
+metric detail=[null_count: curr=312706470,total_records=691520012,threshold=50]
+source partition date=2025-02-16
+***
+*** Validation passed for neighbor_location_id on 2025-02-16
+***
+########################################################
+
+################## PASS ##########################
+metric name=unique_location_id_count
+VALIDATION RESULT=PASS
+metric detail=[unique_count: curr=16663555,prev=16694136,threshold=10]
+source partition date=2025-02-16
+***
+*** Validation passed for unique_location_id_count on 2025-02-16
+***
+########################################################
+
+################## PASS ##########################
+metric name=location_id
+VALIDATION RESULT=PASS
+metric detail=[null_count: curr=0,total_records=691520012,threshold=.0001]
+source partition date=2025-02-16
+***
+*** Validation passed for location_id on 2025-02-16
+***
+########################################################
+
+################## PASS ##########################
+metric name=total_record_count
+VALIDATION RESULT=PASS
+metric detail=[total_count: curr=691520012,prev=735525195,threshold=20]
+source partition date=2025-02-16
+***
+*** Validation passed for total_record_count on 2025-02-16
+***
+########################################################
+
+***
+*** All validation metrics passed on 2025-02-16
+***
+
+
+
+
+
+
+How to identify columns for the validations and the thresholds for metrics
+For columns to be used for validations, please consider the key columns like IDs and the columns which are mostly used in the joins for this table.
+If the table has Mac ID, Then Unique count of Mac ID will be one of the metric to validate
+Expectation is to have the total record count metric, 1 unique column count and 2 NULL count validations. There can be some exceptions which can be discussed with leads
+For Thresholds, We have to have the total count of the table and the % of variances we are seeing over the span of 3 months. Depending on how much % of drop we are seeing in the table frequently, we will set up the threshold %
