@@ -1,0 +1,46 @@
+IPv6 Address Configuration for UE in 5G Core
+
+Overview
+A PDU session, represented by an DNN, is an association between a UE and a data network.  On the UE, a PDU session is equivalent to a network interface.  The SMF in the 5G Core is responsible for the IPv4 address and/or IPv6 prefix allocation to the UE.  3GPP 5G system supports PDU session types IPv4, IPv6, and IPv4v6 (dual-stack).  The UE establishes the PDU session at startup and an IPv4 address and/or IPv6 prefix gets assigned to the UE by the SMF.  Each UE has an IPv4 address and/or IPv6 prefix per PDU session and anchored in the corresponding UPF.  A UE may be attached to one or more UPFs via separate PDU sessions.  In the case of the GTP-based N3 interface, the UPF is the first-hop router for the UE. Applications on the UE use the appropriate PDU session for connectivity.
+
+The UE's IPv4 address configuration is always performed during PDU session establishment procedures.  The SMF supplies an IPv4 address from a local pool or DHCPv4 request.
+
+For IPv6 address assignment to UEs, Stateless Address Autoconfiguration (SLAAC) is the only supported address configuration mechanism.  Stateless DHCPv6 service to obtain additional configuration information is supported.  Stateful DHCPv6-based address configuration is not supported by 3GPP specifications.  When an SMF receives an initial access request (i.e. Nsmf_PDUSession_CreateSMContext) message, the SMF determines from local configuration data the IPv6 Prefixes associated with the DNN.  The SMF includes the IPv6 address composed of a Prefix and an Interface-Identifier in the initial access response (Namf_Communication_N1N2MessageTransfer).  The /64 prefix assigned by the SMF shall be globally unique. The Interface-Identifier may have any value and it does not need to be unique within or across DNNs, but shall not conflict with the SMF's Interface Identifier. After PDU session establishment, the same IPv6 /64 prefix is delivered to UE in Router Advertisement message from the SMF, which acts as an access router, in the process of IPv6 SLAAC. The UE is allowed to use any Interface Identifier it wishes for the address it configures with the /64 prefix. Because the SMF guarantees that the /64 prefix is unique for the UE there is no need to perform any DAD on addresses the UE creates.
+
+The below table shows the relationship between IPv4 address assignment and IPv6 prefix assignment for UEs.
+
+
+
+Glossary
+3GPP - 3rd Generation Partnership Program
+
+5G - 5th Generation
+
+DAD - Duplicate Address Detection
+
+DHCP - Dynamic Host Configuration Protocol
+
+DNN - Data Network Name
+
+PDU - Packet Data Unit
+
+SMF - Session Management Function
+
+RA - Router Advertisement
+
+SLAAC - Stateless Address Autoconfiguration
+
+UE - User Equipment
+
+UPF - User Plane Function
+
+Links
+RFC2131 - Dynamic Host Configuration Protocol
+
+RFC3736 - Stateless Dynamic Host Configuration Protocol (DHCP) Service for IPv6 - 
+
+RFC4861 - Neighbor Discovery for IP version 6 (IPv6) - 
+
+RFC4862 - IPv6 Stateless Address Autoconfiguration - https://datatracker.ietf.org/doc/html/rfc4862
+
+3GPP TS 29.561 - 3GPP Technical Specification: Interworking between 5G Network and external Data Networks
